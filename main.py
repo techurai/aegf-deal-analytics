@@ -21,7 +21,7 @@ logger = logging.getLogger("aegf-deal-analytics")
 app = FastAPI(title="AEGF Deal Analytics")
 
 SERVICE_NAME = os.getenv("SERVICE_NAME", "aegf-deal-analytics")
-ANALYTICS_VERSION = os.getenv("ANALYTICS_VERSION", "2026-05-29-payload-debug-v3")
+ANALYTICS_VERSION = os.getenv("ANALYTICS_VERSION", "2026-05-29-contact-fallback-v4")
 
 GHL_API_BASE = os.getenv("GHL_API_BASE", "https://services.leadconnectorhq.com").rstrip("/")
 GHL_API_VERSION = os.getenv("GHL_API_VERSION", "2023-02-21")
@@ -35,8 +35,9 @@ HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "25"))
 # Optional: if your GHL webhook uses a nonstandard payload key for the opportunity ID,
 # set OPPORTUNITY_ID_FIELD to that key name in Railway.
 OPPORTUNITY_ID_FIELD = os.getenv("OPPORTUNITY_ID_FIELD", "").strip()
-DEBUG_ECHO_PAYLOAD = os.getenv("DEBUG_ECHO_PAYLOAD", "true").strip().lower() in {"1", "true", "yes", "y"}
-LAST_WEBHOOK_DEBUG: Dict[str, Any] = {}
+CONTACT_ID_FIELD = os.getenv("CONTACT_ID_FIELD", "").strip()
+GHL_LOCATION_ID = os.getenv("GHL_LOCATION_ID", "").strip()
+GHL_PIPELINE_ID = os.getenv("GHL_PIPELINE_ID", "").strip()
 
 
 # -----------------------------------------------------------------------------
@@ -1037,6 +1038,252 @@ async def write_sync_status(opportunity_id: str, status: str, error: str = "") -
         logger.exception("Failed to write sync status")
 
 
+
+# -----------------------------------------------------------------------------
+# Opportunity/contact fallback and payload enrichment
+# -----------------------------------------------------------------------------
+
+
+def summarize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a safe, compact summary of webhook payload shape for debugging."""
+    summary: Dict[str, Any] = {
+        "top_level_keys": sorted(payload.keys()),
+    }
+    for key in ("customData", "custom_data", "contact", "opportunity"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            summary[f"{key}_keys"] = sorted(value.keys())
+    return summary
+
+
+def detect_contact_id(payload: Dict[str, Any]) -> Optional[str]:
+    if CONTACT_ID_FIELD:
+        value = get_nested(payload, CONTACT_ID_FIELD) or payload.get(CONTACT_ID_FIELD)
+        if not is_blank(value):
+            return str(value).strip()
+
+    direct_keys = [
+        "contact_id",
+        "contactId",
+        "contact.id",
+        "Contact.id",
+        "contactID",
+    ]
+
+    for key in direct_keys:
+        value = get_nested(payload, key) if "." in key else payload.get(key)
+        if not is_blank(value):
+            return str(value).strip()
+
+    contact = payload.get("contact") or payload.get("Contact")
+    if isinstance(contact, dict):
+        for key in ("id", "contact_id", "contactId"):
+            value = contact.get(key)
+            if not is_blank(value):
+                return str(value).strip()
+
+    return None
+
+
+def detect_location_id(payload: Dict[str, Any]) -> Optional[str]:
+    direct_keys = [
+        "location_id",
+        "locationId",
+        "location.id",
+        "Location.id",
+        "sub_account_id",
+        "subAccountId",
+    ]
+
+    for key in direct_keys:
+        value = get_nested(payload, key) if "." in key else payload.get(key)
+        if not is_blank(value):
+            return str(value).strip()
+
+    location = payload.get("location") or payload.get("Location")
+    if isinstance(location, dict):
+        for key in ("id", "location_id", "locationId"):
+            value = location.get(key)
+            if not is_blank(value):
+                return str(value).strip()
+
+    return GHL_LOCATION_ID or None
+
+
+def extract_opportunities_from_response(data: Any) -> List[Dict[str, Any]]:
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict)]
+    if not isinstance(data, dict):
+        return []
+
+    for key in ("opportunities", "opportunity", "data", "items", "results"):
+        value = data.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+        if isinstance(value, dict):
+            nested = extract_opportunities_from_response(value)
+            if nested:
+                return nested
+
+    return []
+
+
+def opportunity_sort_key(opp: Dict[str, Any]) -> str:
+    # Lexicographic ISO-ish strings work well enough for choosing a latest record.
+    for key in ("updatedAt", "updated_at", "dateUpdated", "createdAt", "created_at", "dateCreated"):
+        value = opp.get(key)
+        if not is_blank(value):
+            return str(value)
+    return ""
+
+
+async def find_opportunity_by_contact(contact_id: str, location_id: str) -> Dict[str, Any]:
+    """Fallback lookup when GHL workflow only sends contact context."""
+    if not GHL_API_KEY:
+        return {"ok": False, "reason": "GHL_API_KEY is not configured"}
+
+    url = f"{GHL_API_BASE}/opportunities/search"
+    attempts: List[Dict[str, Any]] = []
+
+    base_params_variants: List[Dict[str, Any]] = [
+        {"location_id": location_id, "contact_id": contact_id, "limit": 20},
+        {"location_id": location_id, "contactId": contact_id, "limit": 20},
+        {"locationId": location_id, "contactId": contact_id, "limit": 20},
+        {"locationId": location_id, "contact_id": contact_id, "limit": 20},
+    ]
+
+    if GHL_PIPELINE_ID:
+        with_pipeline: List[Dict[str, Any]] = []
+        for params in base_params_variants:
+            p1 = dict(params)
+            p1["pipeline_id"] = GHL_PIPELINE_ID
+            with_pipeline.append(p1)
+            p2 = dict(params)
+            p2["pipelineId"] = GHL_PIPELINE_ID
+            with_pipeline.append(p2)
+        base_params_variants = with_pipeline + base_params_variants
+
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
+        for version in (GHL_API_VERSION, "2021-07-28"):
+            headers = ghl_headers()
+            headers["Version"] = version
+            for params in base_params_variants:
+                attempt: Dict[str, Any] = {
+                    "method": "GET",
+                    "version": version,
+                    "params": params,
+                    "status_code": None,
+                    "opportunities_count": 0,
+                    "error": None,
+                }
+                try:
+                    response = await client.get(url, headers=headers, params=params)
+                    attempt["status_code"] = response.status_code
+                    if response.status_code >= 400:
+                        attempt["error"] = response.text[:500]
+                        attempts.append(attempt)
+                        continue
+                    data = response.json()
+                    opportunities = extract_opportunities_from_response(data)
+                    attempt["opportunities_count"] = len(opportunities)
+                    attempts.append(attempt)
+
+                    if opportunities:
+                        # Prefer open opportunities, then newest-looking record.
+                        open_opps = [o for o in opportunities if str(o.get("status", "")).lower() == "open"]
+                        candidates = open_opps or opportunities
+                        candidates = sorted(candidates, key=opportunity_sort_key, reverse=True)
+                        selected = candidates[0]
+                        selected_id = selected.get("id") or selected.get("opportunityId") or selected.get("_id")
+                        if not is_blank(selected_id):
+                            return {
+                                "ok": True,
+                                "opportunity_id": str(selected_id).strip(),
+                                "contact_id": contact_id,
+                                "location_id": location_id,
+                                "matched_count": len(opportunities),
+                                "selected_status": selected.get("status"),
+                                "attempts": attempts,
+                            }
+                except Exception as exc:
+                    attempt["error"] = str(exc)
+                    attempts.append(attempt)
+
+    return {
+        "ok": False,
+        "reason": "No opportunity found for contact_id/location_id",
+        "contact_id": contact_id,
+        "location_id": location_id,
+        "attempts": attempts,
+    }
+
+
+def extract_opportunity_custom_field_values(
+    opportunity: Dict[str, Any],
+    resolved_field_ids: Dict[str, str],
+) -> Dict[str, Any]:
+    """Convert opportunity custom field IDs back into logical analytics keys."""
+    values: Dict[str, Any] = {}
+    id_to_logical = {str(field_id): logical for logical, field_id in resolved_field_ids.items()}
+
+    fields = []
+    for key in ("customFields", "custom_fields"):
+        value = opportunity.get(key)
+        if isinstance(value, list):
+            fields.extend(item for item in value if isinstance(item, dict))
+
+    for field in fields:
+        field_id = field.get("id") or field.get("fieldId") or field.get("customFieldId")
+        if is_blank(field_id):
+            continue
+        logical_key = id_to_logical.get(str(field_id))
+        if not logical_key:
+            continue
+        for value_key in ("field_value", "fieldValue", "value", "values"):
+            if value_key in field:
+                values[logical_key] = field.get(value_key)
+                break
+
+    return values
+
+
+async def enrich_payload_from_opportunity(payload: Dict[str, Any], opportunity_id: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Fetch current opportunity custom fields so GHL webhook can send only the ID/contact."""
+    meta: Dict[str, Any] = {"attempted": True, "ok": False}
+    enriched = dict(payload)
+
+    try:
+        opportunity = await get_opportunity(opportunity_id)
+        enriched["opportunity"] = opportunity
+        meta["opportunity_keys"] = sorted(opportunity.keys())
+    except Exception as exc:
+        meta["error"] = f"get_opportunity failed: {exc}"
+        return enriched, meta
+
+    location_id = get_location_id_from_opportunity(opportunity) or detect_location_id(payload)
+    if not location_id:
+        meta["error"] = "Could not determine locationId for payload enrichment"
+        return enriched, meta
+
+    try:
+        custom_field_defs = await get_location_custom_fields(location_id)
+        resolved_field_ids, missing = resolve_field_ids(custom_field_defs)
+        values = extract_opportunity_custom_field_values(opportunity, resolved_field_ids)
+        enriched.update(values)
+        meta.update({
+            "ok": True,
+            "location_id": location_id,
+            "custom_field_definitions_count": len(custom_field_defs),
+            "resolved_field_ids_count": len(resolved_field_ids),
+            "enriched_values_count": len(values),
+            "enriched_keys": sorted(values.keys()),
+            "missing_mapped_fields_count": len(missing),
+        })
+    except Exception as exc:
+        meta["error"] = f"custom field enrichment failed: {exc}"
+
+    return enriched, meta
+
 # -----------------------------------------------------------------------------
 # Opportunity ID detection
 # -----------------------------------------------------------------------------
@@ -1061,7 +1308,6 @@ def detect_opportunity_id(payload: Dict[str, Any]) -> Optional[str]:
         "opportunity_id",
         "opportunityId",
         "opportunity.id",
-        "id",
         "opportunityIdString",
         "deal_id",
         "dealId",
@@ -1080,79 +1326,6 @@ def detect_opportunity_id(payload: Dict[str, Any]) -> Optional[str]:
                 return str(value).strip()
 
     return None
-
-
-
-# -----------------------------------------------------------------------------
-# Webhook debug helpers
-# -----------------------------------------------------------------------------
-
-
-def preview_value(value: Any, max_chars: int = 500) -> Any:
-    """Return a debug-safe preview that avoids enormous webhook responses."""
-    if isinstance(value, dict):
-        return {str(k): preview_value(v, max_chars=max_chars) for k, v in list(value.items())[:50]}
-    if isinstance(value, list):
-        return [preview_value(v, max_chars=max_chars) for v in value[:25]]
-    if value is None or isinstance(value, (bool, int, float)):
-        return value
-    text = str(value)
-    if len(text) > max_chars:
-        return text[:max_chars] + f"... [truncated {len(text) - max_chars} chars]"
-    return text
-
-
-def payload_debug_summary(payload: Dict[str, Any], request: Optional[Request] = None) -> Dict[str, Any]:
-    """Summarize exactly what the GHL workflow delivered."""
-    flat = flatten_payload(payload)
-
-    candidate_paths = [
-        OPPORTUNITY_ID_FIELD,
-        "opportunity_id",
-        "opportunityId",
-        "opportunity.id",
-        "id",
-        "customData.opportunity_id",
-        "custom_data.opportunity_id",
-        "data.opportunity_id",
-        "contact_id",
-        "contact.id",
-        "location.id",
-        "locationId",
-    ]
-    candidate_paths = [path for path in candidate_paths if path]
-
-    candidates: Dict[str, Any] = {}
-    for path in candidate_paths:
-        if "." in path:
-            candidates[path] = preview_value(get_nested(payload, path))
-        else:
-            candidates[path] = preview_value(payload.get(path))
-
-    interesting_keys = [
-        key for key in sorted(flat.keys())
-        if any(token in key for token in ("id", "opportun", "pipeline", "location", "contact", "custom"))
-    ][:200]
-
-    headers = {}
-    if request is not None:
-        safe_header_names = {"content-type", "user-agent", "x-forwarded-for", "x-real-ip"}
-        headers = {
-            key: value
-            for key, value in request.headers.items()
-            if key.lower() in safe_header_names
-        }
-
-    return {
-        "received_at": datetime.now(timezone.utc).isoformat(),
-        "top_level_keys": sorted([str(k) for k in payload.keys()]),
-        "opportunity_id_field_env": OPPORTUNITY_ID_FIELD,
-        "detected_opportunity_id": detect_opportunity_id(payload),
-        "candidate_values": candidates,
-        "interesting_flat_keys": interesting_keys,
-        "headers": headers,
-        "payload_preview": preview_value(payload),
-    }
 
 
 # -----------------------------------------------------------------------------
@@ -1183,7 +1356,6 @@ def health_payload() -> Dict[str, Any]:
         "ghl_api_key_loaded": bool(GHL_API_KEY),
         "ghl_api_version": GHL_API_VERSION,
         "uses_resolved_custom_field_ids": True,
-        "debug_echo_payload": DEBUG_ECHO_PAYLOAD,
     }
 
 
@@ -1232,33 +1404,6 @@ async def debug_custom_fields(location_id: str) -> Dict[str, Any]:
         return {"ok": False, "location_id": location_id, "error": str(exc)}
 
 
-
-@app.get("/debug/last-webhook")
-async def debug_last_webhook() -> Dict[str, Any]:
-    return LAST_WEBHOOK_DEBUG or {"ok": False, "reason": "No webhook has been received since this process started"}
-
-
-@app.post("/webhook/ghl-debug")
-async def ghl_webhook_debug(request: Request) -> Dict[str, Any]:
-    """Temporary endpoint: echoes exactly what GHL sent without writing to GHL."""
-    global LAST_WEBHOOK_DEBUG
-    try:
-        payload = await request.json()
-        if not isinstance(payload, dict):
-            return {"ok": False, "error": "Webhook payload must be a JSON object", "payload_type": str(type(payload))}
-    except Exception as exc:
-        body = await request.body()
-        return {
-            "ok": False,
-            "error": f"Invalid JSON payload: {exc}",
-            "raw_body_preview": body.decode("utf-8", errors="replace")[:4000],
-        }
-
-    debug = payload_debug_summary(payload, request)
-    LAST_WEBHOOK_DEBUG = {"ok": True, "debug_only": True, **debug}
-    return LAST_WEBHOOK_DEBUG
-
-
 @app.post("/webhook/ghl")
 async def ghl_webhook(request: Request) -> Dict[str, Any]:
     start = time.perf_counter()
@@ -1270,25 +1415,42 @@ async def ghl_webhook(request: Request) -> Dict[str, Any]:
     except Exception as exc:
         return {"ok": False, "error": f"Invalid JSON payload: {exc}"}
 
-    global LAST_WEBHOOK_DEBUG
-    LAST_WEBHOOK_DEBUG = {"ok": True, "debug_only": False, **payload_debug_summary(payload, request)}
-
     opportunity_id = detect_opportunity_id(payload)
-    calculated_fields = calculate_deal_fields(payload)
-    calculated_fields["last_calculation_runtime_ms"] = int((time.perf_counter() - start) * 1000)
+    detection_source = "payload"
+    opportunity_lookup: Dict[str, Any] = {"attempted": False}
 
     if not opportunity_id:
-        response = {
+        contact_id = detect_contact_id(payload)
+        location_id = detect_location_id(payload)
+        if contact_id and location_id:
+            opportunity_lookup = await find_opportunity_by_contact(contact_id, location_id)
+            if opportunity_lookup.get("ok") and opportunity_lookup.get("opportunity_id"):
+                opportunity_id = str(opportunity_lookup["opportunity_id"])
+                detection_source = "contact_search"
+        else:
+            opportunity_lookup = {
+                "attempted": False,
+                "reason": "Missing contact_id or location_id for fallback opportunity lookup",
+                "contact_id_found": bool(contact_id),
+                "location_id_found": bool(location_id),
+            }
+
+    if not opportunity_id:
+        calculated_fields = calculate_deal_fields(payload)
+        calculated_fields["last_calculation_runtime_ms"] = int((time.perf_counter() - start) * 1000)
+        return {
             "ok": False,
-            "reason": "No opportunity ID found in webhook payload. Add opportunity_id to the GHL webhook/custom data, or set OPPORTUNITY_ID_FIELD.",
+            "reason": "No opportunity ID found in webhook payload and contact fallback lookup did not resolve one.",
             "field_map_loaded": bool(FIELD_MAP),
             "ghl_api_key_loaded": bool(GHL_API_KEY),
+            "payload_summary": summarize_payload(payload),
+            "opportunity_lookup": opportunity_lookup,
             "calculated_fields": calculated_fields,
-            "payload_debug": LAST_WEBHOOK_DEBUG,
         }
-        if DEBUG_ECHO_PAYLOAD:
-            response["payload"] = payload
-        return response
+
+    enriched_payload, enrichment = await enrich_payload_from_opportunity(payload, opportunity_id)
+    calculated_fields = calculate_deal_fields(enriched_payload)
+    calculated_fields["last_calculation_runtime_ms"] = int((time.perf_counter() - start) * 1000)
 
     result = await update_opportunity_custom_fields(opportunity_id, calculated_fields)
 
@@ -1301,13 +1463,15 @@ async def ghl_webhook(request: Request) -> Dict[str, Any]:
         "ok": bool(result.get("ok")),
         "service": SERVICE_NAME,
         "detected_opportunity_id": opportunity_id,
+        "opportunity_detection_source": detection_source,
+        "opportunity_lookup": opportunity_lookup,
+        "payload_enrichment": enrichment,
         "analytics_version": ANALYTICS_VERSION,
         "field_map_loaded": bool(FIELD_MAP),
         "field_map_source": FIELD_MAP_SOURCE,
         "ghl_api_key_loaded": bool(GHL_API_KEY),
         "dry_run": DRY_RUN,
         "uses_resolved_custom_field_ids": True,
-        "payload_debug": LAST_WEBHOOK_DEBUG,
         "calculated_field_keys": sorted(calculated_fields.keys()),
         "ghl_update": result,
         "payload": payload,
