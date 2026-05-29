@@ -3,9 +3,9 @@ import logging
 import os
 import re
 import time
-from datetime import datetime, timezone, date
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import httpx
 from fastapi import FastAPI, Request
@@ -21,7 +21,7 @@ logger = logging.getLogger("aegf-deal-analytics")
 app = FastAPI(title="AEGF Deal Analytics")
 
 SERVICE_NAME = os.getenv("SERVICE_NAME", "aegf-deal-analytics")
-ANALYTICS_VERSION = os.getenv("ANALYTICS_VERSION", "2026-05-29-key-map-v1")
+ANALYTICS_VERSION = os.getenv("ANALYTICS_VERSION", "2026-05-29-id-resolve-v2")
 
 GHL_API_BASE = os.getenv("GHL_API_BASE", "https://services.leadconnectorhq.com").rstrip("/")
 GHL_API_VERSION = os.getenv("GHL_API_VERSION", "2023-02-21")
@@ -41,10 +41,13 @@ OPPORTUNITY_ID_FIELD = os.getenv("OPPORTUNITY_ID_FIELD", "").strip()
 # Field map
 # -----------------------------------------------------------------------------
 # These are the GHL opportunity custom-field keys visible in Settings > Custom Fields.
-# FIELD_MAP in Railway may override or extend this. FIELD_MAP values can be either:
+# FIELD_MAP in Railway may override or extend this. FIELD_MAP values can be:
 #   "opportunity.actual_sale_price"
 #   "{{opportunity.actual_sale_price}}"
 #   "a-real-ghl-custom-field-id"
+#
+# This v2 file does NOT send opportunity.* keys directly to the opportunity update.
+# It resolves the matching location custom field first, then sends the real GHL ID.
 
 FIELD_KEYS = [
     "acquisition_channel",
@@ -121,12 +124,24 @@ FIELD_KEYS = [
 
 DEFAULT_FIELD_MAP: Dict[str, str] = {key: f"opportunity.{key}" for key in FIELD_KEYS}
 
+FIELD_NAME_OVERRIDES: Dict[str, str] = {
+    "actual_cashoncash_return": "Actual Cash-on-Cash Return",
+    "actual_roi": "Actual ROI %",
+    "projected_cashoncash_return": "Projected Cash-on-Cash Return",
+    "projected_roi": "Projected ROI %",
+    "last_calculation_runtime_ms": "Last Calculation Runtime (ms)",
+    "timeline_variance_days": "Timeline Variance Days",
+    "proj_arv": "Proj ARV",
+    "dscr": "DSCR",
+    "mao": "MAO",
+}
+
 FIELD_MAP_LOAD_ERROR: Optional[str] = None
 FIELD_MAP_SOURCE = "default"
 
 
 def normalize_field_ref(value: Any) -> str:
-    """Normalize GHL merge tags into API-ready field keys."""
+    """Normalize GHL merge tags into plain field refs."""
     if value is None:
         return ""
 
@@ -199,10 +214,18 @@ def is_blank(value: Any) -> bool:
     return value is None or (isinstance(value, str) and value.strip() == "")
 
 
+def humanize_logical_key(logical_key: str) -> str:
+    if logical_key in FIELD_NAME_OVERRIDES:
+        return FIELD_NAME_OVERRIDES[logical_key]
+    return logical_key.replace("_", " ").title()
+
+
 def norm_lookup_key(value: Any) -> str:
-    """Normalize keys enough to match payload keys, merge tags, and GHL field keys."""
+    """Normalize keys enough to match payload keys, merge tags, field names, and GHL field keys."""
     text = normalize_field_ref(value).strip().lower()
     text = text.replace("{{", "").replace("}}", "")
+    text = text.replace("%", " percent ")
+    text = text.replace("&", " and ")
     text = re.sub(r"[^a-z0-9]+", "_", text)
     return text.strip("_")
 
@@ -242,9 +265,7 @@ def build_custom_field_lookup(payload: Dict[str, Any]) -> Dict[str, Any]:
             continue
 
         has_custom_field_identity = any(k in obj for k in ("id", "key", "fieldKey", "field_key", "name"))
-        has_custom_field_value = any(
-            k in obj for k in ("field_value", "fieldValue", "value", "values")
-        )
+        has_custom_field_value = any(k in obj for k in ("field_value", "fieldValue", "value", "values"))
 
         if not (has_custom_field_identity and has_custom_field_value):
             continue
@@ -271,6 +292,7 @@ def field_candidates(logical_key: str) -> List[str]:
         logical_key,
         normalized_ref,
         f"{{{{{normalized_ref}}}}}",
+        humanize_logical_key(logical_key),
     ]
 
     if normalized_ref.startswith("opportunity."):
@@ -615,32 +637,165 @@ def ghl_headers() -> Dict[str, str]:
     }
 
 
-def field_ref_to_custom_field(logical_key: str, value: Any) -> Optional[Dict[str, Any]]:
-    if logical_key not in FIELD_MAP:
-        return None
-
-    ref = normalize_field_ref(FIELD_MAP[logical_key])
+def looks_like_custom_field_id(ref: str) -> bool:
+    """GHL field IDs are opaque strings; field keys usually contain a dot or readable words."""
     if not ref:
-        return None
+        return False
+    if ref.startswith("opportunity.") or ref.startswith("contact."):
+        return False
+    if "{{" in ref or "}}" in ref:
+        return False
+    if "." in ref:
+        return False
+    # Existing GHL ids in your response looked like 20-char mixed-case ids.
+    return bool(re.fullmatch(r"[A-Za-z0-9_-]{12,80}", ref))
 
-    # If it looks like a GHL fieldKey, send it as key. Otherwise assume it is an id.
-    if "." in ref or ref.startswith("opportunity_") or ref.startswith("contact_"):
-        return {"key": ref, "field_value": value}
 
-    return {"id": ref, "field_value": value}
+def definition_identities(field_def: Dict[str, Any]) -> List[str]:
+    identities: List[str] = []
+
+    for key in (
+        "id",
+        "name",
+        "key",
+        "fieldKey",
+        "field_key",
+        "placeholder",
+        "label",
+        "displayName",
+        "display_name",
+        "objectKey",
+        "object_key",
+        "parentId",
+    ):
+        value = field_def.get(key)
+        if not is_blank(value):
+            identities.append(str(value))
+
+    # Some custom-field API responses nest additional searchable data.
+    for nested_key in ("field", "customField", "schema"):
+        nested = field_def.get(nested_key)
+        if isinstance(nested, dict):
+            identities.extend(definition_identities(nested))
+
+    return identities
 
 
-def build_custom_fields(calculated_fields: Dict[str, Any]) -> List[Dict[str, Any]]:
+def build_definition_lookup(custom_field_defs: List[Dict[str, Any]]) -> Dict[str, str]:
+    """Build a normalized identity -> GHL custom field ID lookup."""
+    lookup: Dict[str, str] = {}
+
+    for field_def in custom_field_defs:
+        if not isinstance(field_def, dict):
+            continue
+
+        field_id = field_def.get("id") or field_def.get("fieldId") or field_def.get("customFieldId")
+        if is_blank(field_id):
+            continue
+
+        field_id = str(field_id).strip()
+        for identity in definition_identities(field_def):
+            normalized = norm_lookup_key(identity)
+            if normalized:
+                lookup[normalized] = field_id
+
+            # Helpful extra normalization: opportunity.foo should also match foo.
+            cleaned = normalize_field_ref(identity)
+            if cleaned.startswith("opportunity."):
+                lookup[norm_lookup_key(cleaned.replace("opportunity.", "", 1))] = field_id
+
+    return lookup
+
+
+def resolve_field_ids(custom_field_defs: List[Dict[str, Any]]) -> Tuple[Dict[str, str], List[str]]:
+    """Resolve logical analytics keys to actual GHL custom field IDs."""
+    definition_lookup = build_definition_lookup(custom_field_defs)
+    resolved: Dict[str, str] = {}
+    missing: List[str] = []
+
+    for logical_key, raw_ref in FIELD_MAP.items():
+        ref = normalize_field_ref(raw_ref)
+
+        # If FIELD_MAP already contains a real field ID, keep it.
+        if looks_like_custom_field_id(ref):
+            resolved[logical_key] = ref
+            continue
+
+        matched_id = None
+        for candidate in field_candidates(logical_key):
+            normalized = norm_lookup_key(candidate)
+            if normalized in definition_lookup:
+                matched_id = definition_lookup[normalized]
+                break
+
+        if matched_id:
+            resolved[logical_key] = matched_id
+        else:
+            missing.append(logical_key)
+
+    return resolved, missing
+
+
+def build_custom_fields_from_ids(
+    calculated_fields: Dict[str, Any],
+    resolved_field_ids: Dict[str, str],
+) -> Tuple[List[Dict[str, Any]], List[str]]:
     custom_fields: List[Dict[str, Any]] = []
+    skipped_unresolved: List[str] = []
 
     for logical_key, value in calculated_fields.items():
         if is_blank(value):
             continue
-        custom_field = field_ref_to_custom_field(logical_key, value)
-        if custom_field:
-            custom_fields.append(custom_field)
 
-    return custom_fields
+        field_id = resolved_field_ids.get(logical_key)
+        if not field_id:
+            skipped_unresolved.append(logical_key)
+            continue
+
+        custom_fields.append({"id": field_id, "field_value": value})
+
+    return custom_fields, skipped_unresolved
+
+
+def extract_custom_fields_from_response(data: Any) -> List[Dict[str, Any]]:
+    if not isinstance(data, dict):
+        return []
+
+    for key in ("customFields", "custom_fields", "fields"):
+        value = data.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+
+    # Some responses wrap custom fields under location or customFields key.
+    for wrapper_key in ("location", "customField", "customFieldFolder", "data"):
+        wrapped = data.get(wrapper_key)
+        if isinstance(wrapped, dict):
+            found = extract_custom_fields_from_response(wrapped)
+            if found:
+                return found
+
+    return []
+
+
+async def get_location_custom_fields(location_id: str) -> List[Dict[str, Any]]:
+    if not GHL_API_KEY:
+        raise RuntimeError("GHL_API_KEY is not configured")
+
+    url = f"{GHL_API_BASE}/locations/{location_id}/customFields"
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
+        response = await client.get(url, headers=ghl_headers())
+        response.raise_for_status()
+        data = response.json()
+
+    fields = extract_custom_fields_from_response(data)
+    if not fields and isinstance(data, dict):
+        # Last-resort shape support: top-level list-like values.
+        for value in data.values():
+            if isinstance(value, list) and value and all(isinstance(item, dict) for item in value):
+                fields = value
+                break
+
+    return fields
 
 
 async def get_opportunity(opportunity_id: str) -> Dict[str, Any]:
@@ -687,57 +842,87 @@ def base_update_body_from_opportunity(opportunity: Dict[str, Any]) -> Dict[str, 
     return body
 
 
+def get_location_id_from_opportunity(opportunity: Dict[str, Any]) -> Optional[str]:
+    value = opportunity.get("locationId") or opportunity.get("location_id")
+    if not is_blank(value):
+        return str(value).strip()
+
+    location = opportunity.get("location")
+    if isinstance(location, dict):
+        value = location.get("id") or location.get("locationId")
+        if not is_blank(value):
+            return str(value).strip()
+
+    return None
+
+
 async def update_opportunity_custom_fields(
     opportunity_id: str,
-    custom_fields: List[Dict[str, Any]],
     calculated_fields: Dict[str, Any],
 ) -> Dict[str, Any]:
     if not GHL_API_KEY:
         return {"ok": False, "skipped": True, "reason": "GHL_API_KEY is not configured"}
 
-    if not custom_fields:
-        return {"ok": True, "skipped": True, "reason": "No mapped custom fields to update"}
-
     if DRY_RUN:
         return {
             "ok": True,
             "dry_run": True,
-            "custom_fields_count": len(custom_fields),
             "calculated_fields": calculated_fields,
         }
 
-    url = f"{GHL_API_BASE}/opportunities/{opportunity_id}"
+    try:
+        current_opp = await get_opportunity(opportunity_id)
+    except Exception as exc:
+        return {"ok": False, "stage": "get_opportunity", "error": str(exc)}
 
-    # Start by trying a focused customFields-only update. If HighLevel requires
-    # standard opportunity fields for this account/API version, retry with the
-    # current opportunity values included.
-    body = {"customFields": custom_fields}
+    location_id = get_location_id_from_opportunity(current_opp)
+    if not location_id:
+        return {
+            "ok": False,
+            "stage": "get_location_id",
+            "reason": "Opportunity response did not include locationId",
+            "opportunity_keys": sorted(current_opp.keys()),
+        }
+
+    try:
+        custom_field_defs = await get_location_custom_fields(location_id)
+    except Exception as exc:
+        return {"ok": False, "stage": "get_location_custom_fields", "location_id": location_id, "error": str(exc)}
+
+    resolved_field_ids, missing_mapped_fields = resolve_field_ids(custom_field_defs)
+    custom_fields, skipped_unresolved_calculated = build_custom_fields_from_ids(calculated_fields, resolved_field_ids)
+
+    if not custom_fields:
+        return {
+            "ok": False,
+            "stage": "build_custom_fields",
+            "reason": "No calculated fields resolved to GHL custom field IDs",
+            "location_id": location_id,
+            "custom_field_definitions_count": len(custom_field_defs),
+            "resolved_field_ids_count": len(resolved_field_ids),
+            "missing_mapped_fields": missing_mapped_fields,
+            "calculated_field_keys": sorted(calculated_fields.keys()),
+            "skipped_unresolved_calculated": skipped_unresolved_calculated,
+        }
+
+    url = f"{GHL_API_BASE}/opportunities/{opportunity_id}"
+    body = base_update_body_from_opportunity(current_opp)
+    body["customFields"] = custom_fields
 
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
         response = await client.put(url, headers=ghl_headers(), json=body)
 
-        if response.status_code in {400, 422}:
-            first_error_text = response.text[:1000]
-            logger.warning("Custom-fields-only update failed; retrying with opportunity base fields: %s", first_error_text)
-
-            try:
-                current_opp = await get_opportunity(opportunity_id)
-                retry_body = base_update_body_from_opportunity(current_opp)
-                retry_body["customFields"] = custom_fields
-                response = await client.put(url, headers=ghl_headers(), json=retry_body)
-            except Exception as exc:
-                return {
-                    "ok": False,
-                    "status_code": response.status_code,
-                    "error": first_error_text,
-                    "retry_error": str(exc),
-                }
-
         if response.status_code >= 400:
             return {
                 "ok": False,
+                "stage": "put_opportunity",
                 "status_code": response.status_code,
                 "error": response.text[:2000],
+                "location_id": location_id,
+                "custom_fields_count": len(custom_fields),
+                "resolved_field_ids_count": len(resolved_field_ids),
+                "resolved_field_ids_used": sorted({k for k in calculated_fields if k in resolved_field_ids}),
+                "skipped_unresolved_calculated": skipped_unresolved_calculated,
             }
 
         try:
@@ -748,7 +933,14 @@ async def update_opportunity_custom_fields(
         return {
             "ok": True,
             "status_code": response.status_code,
+            "location_id": location_id,
+            "custom_field_definitions_count": len(custom_field_defs),
+            "resolved_field_ids_count": len(resolved_field_ids),
             "custom_fields_count": len(custom_fields),
+            "resolved_field_ids_used": sorted({k for k in calculated_fields if k in resolved_field_ids}),
+            "skipped_unresolved_calculated": skipped_unresolved_calculated,
+            "missing_mapped_fields_count": len(missing_mapped_fields),
+            "missing_mapped_fields_sample": missing_mapped_fields[:15],
             "response": response_json,
         }
 
@@ -760,9 +952,8 @@ async def write_sync_status(opportunity_id: str, status: str, error: str = "") -
             "last_sync_status": status,
             "last_sync_error": error[:500] if error else "",
         }
-        custom_fields = build_custom_fields(fields)
-        if custom_fields and GHL_API_KEY and not DRY_RUN:
-            await update_opportunity_custom_fields(opportunity_id, custom_fields, fields)
+        if GHL_API_KEY and not DRY_RUN:
+            await update_opportunity_custom_fields(opportunity_id, fields)
     except Exception:
         logger.exception("Failed to write sync status")
 
@@ -838,6 +1029,7 @@ def health_payload() -> Dict[str, Any]:
         "field_map_error": FIELD_MAP_LOAD_ERROR,
         "ghl_api_key_loaded": bool(GHL_API_KEY),
         "ghl_api_version": GHL_API_VERSION,
+        "uses_resolved_custom_field_ids": True,
     }
 
 
@@ -849,6 +1041,38 @@ async def debug_field_map() -> Dict[str, Any]:
         "count": len(FIELD_MAP),
         "field_map": FIELD_MAP,
     }
+
+
+@app.get("/debug/custom-fields/{location_id}")
+async def debug_custom_fields(location_id: str) -> Dict[str, Any]:
+    try:
+        custom_field_defs = await get_location_custom_fields(location_id)
+        resolved_field_ids, missing = resolve_field_ids(custom_field_defs)
+
+        sample = []
+        for field_def in custom_field_defs[:20]:
+            if isinstance(field_def, dict):
+                sample.append(
+                    {
+                        "id": field_def.get("id") or field_def.get("fieldId") or field_def.get("customFieldId"),
+                        "name": field_def.get("name"),
+                        "key": field_def.get("key") or field_def.get("fieldKey") or field_def.get("field_key"),
+                        "type": field_def.get("dataType") or field_def.get("type"),
+                    }
+                )
+
+        return {
+            "ok": True,
+            "location_id": location_id,
+            "custom_fields_count": len(custom_field_defs),
+            "resolved_field_ids_count": len(resolved_field_ids),
+            "missing_mapped_fields_count": len(missing),
+            "missing_mapped_fields": missing,
+            "resolved_field_ids": resolved_field_ids,
+            "custom_fields_sample": sample,
+        }
+    except Exception as exc:
+        return {"ok": False, "location_id": location_id, "error": str(exc)}
 
 
 @app.post("/webhook/ghl")
@@ -866,8 +1090,6 @@ async def ghl_webhook(request: Request) -> Dict[str, Any]:
     calculated_fields = calculate_deal_fields(payload)
     calculated_fields["last_calculation_runtime_ms"] = int((time.perf_counter() - start) * 1000)
 
-    custom_fields = build_custom_fields(calculated_fields)
-
     if not opportunity_id:
         return {
             "ok": False,
@@ -875,10 +1097,9 @@ async def ghl_webhook(request: Request) -> Dict[str, Any]:
             "field_map_loaded": bool(FIELD_MAP),
             "ghl_api_key_loaded": bool(GHL_API_KEY),
             "calculated_fields": calculated_fields,
-            "custom_fields_count": len(custom_fields),
         }
 
-    result = await update_opportunity_custom_fields(opportunity_id, custom_fields, calculated_fields)
+    result = await update_opportunity_custom_fields(opportunity_id, calculated_fields)
 
     if result.get("ok"):
         await write_sync_status(opportunity_id, "Success", "")
@@ -889,12 +1110,13 @@ async def ghl_webhook(request: Request) -> Dict[str, Any]:
         "ok": bool(result.get("ok")),
         "service": SERVICE_NAME,
         "detected_opportunity_id": opportunity_id,
+        "analytics_version": ANALYTICS_VERSION,
         "field_map_loaded": bool(FIELD_MAP),
         "field_map_source": FIELD_MAP_SOURCE,
         "ghl_api_key_loaded": bool(GHL_API_KEY),
         "dry_run": DRY_RUN,
+        "uses_resolved_custom_field_ids": True,
         "calculated_field_keys": sorted(calculated_fields.keys()),
-        "custom_fields_count": len(custom_fields),
         "ghl_update": result,
         "payload": payload,
     }
