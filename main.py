@@ -21,7 +21,7 @@ logger = logging.getLogger("aegf-deal-analytics")
 app = FastAPI(title="AEGF Deal Analytics")
 
 SERVICE_NAME = os.getenv("SERVICE_NAME", "aegf-deal-analytics")
-ANALYTICS_VERSION = os.getenv("ANALYTICS_VERSION", "2026-05-29-id-resolve-v2")
+ANALYTICS_VERSION = os.getenv("ANALYTICS_VERSION", "2026-05-29-opportunity-fields-v3")
 
 GHL_API_BASE = os.getenv("GHL_API_BASE", "https://services.leadconnectorhq.com").rstrip("/")
 GHL_API_VERSION = os.getenv("GHL_API_VERSION", "2023-02-21")
@@ -777,17 +777,29 @@ def extract_custom_fields_from_response(data: Any) -> List[Dict[str, Any]]:
     return []
 
 
-async def get_location_custom_fields(location_id: str) -> List[Dict[str, Any]]:
-    if not GHL_API_KEY:
-        raise RuntimeError("GHL_API_KEY is not configured")
+def dedupe_custom_field_defs(fields: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Deduplicate custom-field definitions while preserving order."""
+    seen: set = set()
+    deduped: List[Dict[str, Any]] = []
 
-    url = f"{GHL_API_BASE}/locations/{location_id}/customFields"
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
-        response = await client.get(url, headers=ghl_headers())
-        response.raise_for_status()
-        data = response.json()
+    for field in fields:
+        if not isinstance(field, dict):
+            continue
 
+        field_id = field.get("id") or field.get("fieldId") or field.get("customFieldId")
+        identity = str(field_id or field.get("key") or field.get("fieldKey") or field.get("name") or repr(field))
+        if identity in seen:
+            continue
+
+        seen.add(identity)
+        deduped.append(field)
+
+    return deduped
+
+
+def extract_fields_from_any_response(data: Any) -> List[Dict[str, Any]]:
     fields = extract_custom_fields_from_response(data)
+
     if not fields and isinstance(data, dict):
         # Last-resort shape support: top-level list-like values.
         for value in data.values():
@@ -795,6 +807,71 @@ async def get_location_custom_fields(location_id: str) -> List[Dict[str, Any]]:
                 fields = value
                 break
 
+    return [item for item in fields if isinstance(item, dict)]
+
+
+async def get_location_custom_fields_with_debug(location_id: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Fetch GHL custom fields with several variants.
+
+    The plain location custom-fields endpoint can return only contact/default fields in
+    some HighLevel accounts. Opportunity fields usually require model=opportunity.
+    We try both current and legacy Version headers because HighLevel's custom-field
+    docs and behavior vary across custom-field generations.
+    """
+    if not GHL_API_KEY:
+        raise RuntimeError("GHL_API_KEY is not configured")
+
+    attempts: List[Dict[str, Any]] = []
+    collected: List[Dict[str, Any]] = []
+
+    request_variants = [
+        (GHL_API_VERSION, {"model": "opportunity"}),
+        (GHL_API_VERSION, {"model": "all"}),
+        (GHL_API_VERSION, None),
+        ("2021-07-28", {"model": "opportunity"}),
+        ("2021-07-28", {"model": "all"}),
+        ("2021-07-28", None),
+    ]
+
+    url = f"{GHL_API_BASE}/locations/{location_id}/customFields"
+
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
+        for version, params in request_variants:
+            headers = ghl_headers()
+            headers["Version"] = version
+
+            attempt_info: Dict[str, Any] = {
+                "version": version,
+                "params": params or {},
+                "status_code": None,
+                "fields_count": 0,
+                "error": None,
+            }
+
+            try:
+                response = await client.get(url, headers=headers, params=params)
+                attempt_info["status_code"] = response.status_code
+
+                if response.status_code >= 400:
+                    attempt_info["error"] = response.text[:500]
+                    attempts.append(attempt_info)
+                    continue
+
+                data = response.json()
+                fields = extract_fields_from_any_response(data)
+                attempt_info["fields_count"] = len(fields)
+                collected.extend(fields)
+            except Exception as exc:
+                attempt_info["error"] = str(exc)
+
+            attempts.append(attempt_info)
+
+    return dedupe_custom_field_defs(collected), attempts
+
+
+async def get_location_custom_fields(location_id: str) -> List[Dict[str, Any]]:
+    fields, _attempts = await get_location_custom_fields_with_debug(location_id)
     return fields
 
 
@@ -1046,17 +1123,18 @@ async def debug_field_map() -> Dict[str, Any]:
 @app.get("/debug/custom-fields/{location_id}")
 async def debug_custom_fields(location_id: str) -> Dict[str, Any]:
     try:
-        custom_field_defs = await get_location_custom_fields(location_id)
+        custom_field_defs, fetch_attempts = await get_location_custom_fields_with_debug(location_id)
         resolved_field_ids, missing = resolve_field_ids(custom_field_defs)
 
         sample = []
-        for field_def in custom_field_defs[:20]:
+        for field_def in custom_field_defs[:50]:
             if isinstance(field_def, dict):
                 sample.append(
                     {
                         "id": field_def.get("id") or field_def.get("fieldId") or field_def.get("customFieldId"),
                         "name": field_def.get("name"),
                         "key": field_def.get("key") or field_def.get("fieldKey") or field_def.get("field_key"),
+                        "model": field_def.get("model") or field_def.get("objectKey") or field_def.get("object_key"),
                         "type": field_def.get("dataType") or field_def.get("type"),
                     }
                 )
@@ -1064,11 +1142,13 @@ async def debug_custom_fields(location_id: str) -> Dict[str, Any]:
         return {
             "ok": True,
             "location_id": location_id,
+            "analytics_version": ANALYTICS_VERSION,
             "custom_fields_count": len(custom_field_defs),
             "resolved_field_ids_count": len(resolved_field_ids),
             "missing_mapped_fields_count": len(missing),
             "missing_mapped_fields": missing,
             "resolved_field_ids": resolved_field_ids,
+            "fetch_attempts": fetch_attempts,
             "custom_fields_sample": sample,
         }
     except Exception as exc:
