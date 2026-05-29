@@ -21,7 +21,7 @@ logger = logging.getLogger("aegf-deal-analytics")
 app = FastAPI(title="AEGF Deal Analytics")
 
 SERVICE_NAME = os.getenv("SERVICE_NAME", "aegf-deal-analytics")
-ANALYTICS_VERSION = os.getenv("ANALYTICS_VERSION", "2026-05-29-opportunity-fields-v3")
+ANALYTICS_VERSION = os.getenv("ANALYTICS_VERSION", "2026-05-29-payload-debug-v3")
 
 GHL_API_BASE = os.getenv("GHL_API_BASE", "https://services.leadconnectorhq.com").rstrip("/")
 GHL_API_VERSION = os.getenv("GHL_API_VERSION", "2023-02-21")
@@ -35,6 +35,8 @@ HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "25"))
 # Optional: if your GHL webhook uses a nonstandard payload key for the opportunity ID,
 # set OPPORTUNITY_ID_FIELD to that key name in Railway.
 OPPORTUNITY_ID_FIELD = os.getenv("OPPORTUNITY_ID_FIELD", "").strip()
+DEBUG_ECHO_PAYLOAD = os.getenv("DEBUG_ECHO_PAYLOAD", "true").strip().lower() in {"1", "true", "yes", "y"}
+LAST_WEBHOOK_DEBUG: Dict[str, Any] = {}
 
 
 # -----------------------------------------------------------------------------
@@ -1059,6 +1061,7 @@ def detect_opportunity_id(payload: Dict[str, Any]) -> Optional[str]:
         "opportunity_id",
         "opportunityId",
         "opportunity.id",
+        "id",
         "opportunityIdString",
         "deal_id",
         "dealId",
@@ -1077,6 +1080,79 @@ def detect_opportunity_id(payload: Dict[str, Any]) -> Optional[str]:
                 return str(value).strip()
 
     return None
+
+
+
+# -----------------------------------------------------------------------------
+# Webhook debug helpers
+# -----------------------------------------------------------------------------
+
+
+def preview_value(value: Any, max_chars: int = 500) -> Any:
+    """Return a debug-safe preview that avoids enormous webhook responses."""
+    if isinstance(value, dict):
+        return {str(k): preview_value(v, max_chars=max_chars) for k, v in list(value.items())[:50]}
+    if isinstance(value, list):
+        return [preview_value(v, max_chars=max_chars) for v in value[:25]]
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    text = str(value)
+    if len(text) > max_chars:
+        return text[:max_chars] + f"... [truncated {len(text) - max_chars} chars]"
+    return text
+
+
+def payload_debug_summary(payload: Dict[str, Any], request: Optional[Request] = None) -> Dict[str, Any]:
+    """Summarize exactly what the GHL workflow delivered."""
+    flat = flatten_payload(payload)
+
+    candidate_paths = [
+        OPPORTUNITY_ID_FIELD,
+        "opportunity_id",
+        "opportunityId",
+        "opportunity.id",
+        "id",
+        "customData.opportunity_id",
+        "custom_data.opportunity_id",
+        "data.opportunity_id",
+        "contact_id",
+        "contact.id",
+        "location.id",
+        "locationId",
+    ]
+    candidate_paths = [path for path in candidate_paths if path]
+
+    candidates: Dict[str, Any] = {}
+    for path in candidate_paths:
+        if "." in path:
+            candidates[path] = preview_value(get_nested(payload, path))
+        else:
+            candidates[path] = preview_value(payload.get(path))
+
+    interesting_keys = [
+        key for key in sorted(flat.keys())
+        if any(token in key for token in ("id", "opportun", "pipeline", "location", "contact", "custom"))
+    ][:200]
+
+    headers = {}
+    if request is not None:
+        safe_header_names = {"content-type", "user-agent", "x-forwarded-for", "x-real-ip"}
+        headers = {
+            key: value
+            for key, value in request.headers.items()
+            if key.lower() in safe_header_names
+        }
+
+    return {
+        "received_at": datetime.now(timezone.utc).isoformat(),
+        "top_level_keys": sorted([str(k) for k in payload.keys()]),
+        "opportunity_id_field_env": OPPORTUNITY_ID_FIELD,
+        "detected_opportunity_id": detect_opportunity_id(payload),
+        "candidate_values": candidates,
+        "interesting_flat_keys": interesting_keys,
+        "headers": headers,
+        "payload_preview": preview_value(payload),
+    }
 
 
 # -----------------------------------------------------------------------------
@@ -1107,6 +1183,7 @@ def health_payload() -> Dict[str, Any]:
         "ghl_api_key_loaded": bool(GHL_API_KEY),
         "ghl_api_version": GHL_API_VERSION,
         "uses_resolved_custom_field_ids": True,
+        "debug_echo_payload": DEBUG_ECHO_PAYLOAD,
     }
 
 
@@ -1155,6 +1232,33 @@ async def debug_custom_fields(location_id: str) -> Dict[str, Any]:
         return {"ok": False, "location_id": location_id, "error": str(exc)}
 
 
+
+@app.get("/debug/last-webhook")
+async def debug_last_webhook() -> Dict[str, Any]:
+    return LAST_WEBHOOK_DEBUG or {"ok": False, "reason": "No webhook has been received since this process started"}
+
+
+@app.post("/webhook/ghl-debug")
+async def ghl_webhook_debug(request: Request) -> Dict[str, Any]:
+    """Temporary endpoint: echoes exactly what GHL sent without writing to GHL."""
+    global LAST_WEBHOOK_DEBUG
+    try:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            return {"ok": False, "error": "Webhook payload must be a JSON object", "payload_type": str(type(payload))}
+    except Exception as exc:
+        body = await request.body()
+        return {
+            "ok": False,
+            "error": f"Invalid JSON payload: {exc}",
+            "raw_body_preview": body.decode("utf-8", errors="replace")[:4000],
+        }
+
+    debug = payload_debug_summary(payload, request)
+    LAST_WEBHOOK_DEBUG = {"ok": True, "debug_only": True, **debug}
+    return LAST_WEBHOOK_DEBUG
+
+
 @app.post("/webhook/ghl")
 async def ghl_webhook(request: Request) -> Dict[str, Any]:
     start = time.perf_counter()
@@ -1166,18 +1270,25 @@ async def ghl_webhook(request: Request) -> Dict[str, Any]:
     except Exception as exc:
         return {"ok": False, "error": f"Invalid JSON payload: {exc}"}
 
+    global LAST_WEBHOOK_DEBUG
+    LAST_WEBHOOK_DEBUG = {"ok": True, "debug_only": False, **payload_debug_summary(payload, request)}
+
     opportunity_id = detect_opportunity_id(payload)
     calculated_fields = calculate_deal_fields(payload)
     calculated_fields["last_calculation_runtime_ms"] = int((time.perf_counter() - start) * 1000)
 
     if not opportunity_id:
-        return {
+        response = {
             "ok": False,
             "reason": "No opportunity ID found in webhook payload. Add opportunity_id to the GHL webhook/custom data, or set OPPORTUNITY_ID_FIELD.",
             "field_map_loaded": bool(FIELD_MAP),
             "ghl_api_key_loaded": bool(GHL_API_KEY),
             "calculated_fields": calculated_fields,
+            "payload_debug": LAST_WEBHOOK_DEBUG,
         }
+        if DEBUG_ECHO_PAYLOAD:
+            response["payload"] = payload
+        return response
 
     result = await update_opportunity_custom_fields(opportunity_id, calculated_fields)
 
@@ -1196,6 +1307,7 @@ async def ghl_webhook(request: Request) -> Dict[str, Any]:
         "ghl_api_key_loaded": bool(GHL_API_KEY),
         "dry_run": DRY_RUN,
         "uses_resolved_custom_field_ids": True,
+        "payload_debug": LAST_WEBHOOK_DEBUG,
         "calculated_field_keys": sorted(calculated_fields.keys()),
         "ghl_update": result,
         "payload": payload,
